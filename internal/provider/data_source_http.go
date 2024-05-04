@@ -81,13 +81,16 @@ a 5xx-range (except 501) status code is received. For further details see
 			"method": schema.StringAttribute{
 				Description: "The HTTP Method for the request. " +
 					"Allowed methods are a subset of methods defined in [RFC7231](https://datatracker.ietf.org/doc/html/rfc7231#section-4.3) namely, " +
-					"`GET`, `HEAD`, and `POST`. `POST` support is only intended for read-only URLs, such as submitting a search.",
+					"`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`. Using muting methods like `POST`, `PUT`, `PATCH` and `DELETE` require careful configuration to ensure results are idempotent.",
 				Optional: true,
 				Validators: []validator.String{
 					stringvalidator.OneOf([]string{
 						http.MethodGet,
-						http.MethodPost,
 						http.MethodHead,
+						http.MethodPost,
+						http.MethodPut,
+						http.MethodPatch,
+						http.MethodDelete,
 					}...),
 				},
 			},
@@ -153,6 +156,23 @@ a 5xx-range (except 501) status code is received. For further details see
 				Description: `The HTTP response status code.`,
 				Computed:    true,
 			},
+
+			"client_cert_pem": schema.StringAttribute{
+				Description: "Client Certificate (PEM) to present to the target server.",
+				Optional:    true,
+				Validators: []validator.String{
+					stringvalidator.ConflictsWith(path.MatchRoot("insecure")),
+				},
+			},
+
+			"client_key_pem": schema.StringAttribute{
+				Description: "Client Certificate (PEM) private Key to use for mTLS.",
+				Optional:    true,
+				Sensitive:   true,
+				Validators: []validator.String{
+					stringvalidator.ConflictsWith(path.MatchRoot("insecure")),
+				},
+			},
 		},
 
 		Blocks: map[string]schema.Block{
@@ -206,6 +226,8 @@ func (d *httpDataSource) Read(ctx context.Context, req datasource.ReadRequest, r
 	}
 
 	caCertificate := model.CaCertificate
+	clientCertificate := model.ClientCertificate
+	clientKey := model.ClientKey
 
 	tr, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
@@ -250,6 +272,33 @@ func (d *httpDataSource) Read(ctx context.Context, req datasource.ReadRequest, r
 			clonedTr.TLSClientConfig = &tls.Config{}
 		}
 		clonedTr.TLSClientConfig.RootCAs = caCertPool
+	}
+
+	if !clientCertificate.IsNull() {
+		if clientKey.IsNull() {
+			resp.Diagnostics.AddError(
+				"Need to specify both Client Certificate and Client Key",
+				"Client Key is empty",
+			)
+			return
+		}
+		clientCerts, err := tls.X509KeyPair(
+			[]byte(clientCertificate.ValueString()),
+			[]byte(clientKey.ValueString()),
+		)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Error loading client certificates",
+				fmt.Sprintf("Error loading client certificates: %s", err),
+			)
+
+			return
+		}
+
+		if clonedTr.TLSClientConfig == nil {
+			clonedTr.TLSClientConfig = &tls.Config{}
+		}
+		clonedTr.TLSClientConfig.Certificates = []tls.Certificate{clientCerts}
 	}
 
 	var retry retryModel
@@ -397,6 +446,8 @@ type modelV0 struct {
 	Retry              types.Object `tfsdk:"retry"`
 	ResponseHeaders    types.Map    `tfsdk:"response_headers"`
 	CaCertificate      types.String `tfsdk:"ca_cert_pem"`
+	ClientCertificate  types.String `tfsdk:"client_cert_pem"`
+	ClientKey          types.String `tfsdk:"client_key_pem"`
 	Insecure           types.Bool   `tfsdk:"insecure"`
 	ResponseBody       types.String `tfsdk:"response_body"`
 	Body               types.String `tfsdk:"body"`
